@@ -14,7 +14,6 @@ Variables d'environnement requises :
 import asyncio
 import logging
 import os
-import requests
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
