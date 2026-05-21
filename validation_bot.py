@@ -511,7 +511,11 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_router))
 
     logger.info("Bot de validation centralise demarre")
-    app.run_polling(allowed_updates=["message", "callback_query"], drop_pending_updates=True)
+    app.run_polling(
+        allowed_updates=["message", "callback_query"],
+        drop_pending_updates=True,
+        close_loop=False
+    )
 
 
 if __name__ == "__main__":
