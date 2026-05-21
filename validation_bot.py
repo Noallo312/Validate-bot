@@ -501,7 +501,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Action inconnue", show_alert=True)
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
-async def main():
+def main():
     if not VALIDATION_BOT_TOKEN or VALIDATION_BOT_TOKEN == "METS_TON_TOKEN_ICI":
         logger.error("VALIDATION_BOT_TOKEN non configure !")
         return
@@ -511,8 +511,8 @@ async def main():
     app.add_handler(CallbackQueryHandler(callback_router))
 
     logger.info("Bot de validation centralise demarre")
-    await app.run_polling(allowed_updates=["message", "callback_query"], drop_pending_updates=True)
+    app.run_polling(allowed_updates=["message", "callback_query"], drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
