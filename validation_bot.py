@@ -156,7 +156,11 @@ def kfc_validate_deposit_atomic(deposit_id: int, user_id: int, amount: float) ->
         raise Exception("KFC_DATABASE_URL non configure")
     try:
         cur = db.cursor()
-        cur.execute("UPDATE deposits SET status = 'completed' WHERE id = %s AND status = 'pending'", (deposit_id,))
+        # Accepte 'pending' ET 'awaiting_proof' (les dépôts PayPal sont créés avec awaiting_proof)
+        cur.execute(
+            "UPDATE deposits SET status = 'completed' WHERE id = %s AND status IN ('pending', 'awaiting_proof')",
+            (deposit_id,)
+        )
         if cur.rowcount == 0:
             raise Exception("Depot introuvable ou deja traite")
         cur.execute("UPDATE users SET balance = balance + %s WHERE user_id = %s", (amount, user_id))
