@@ -75,63 +75,107 @@ def b4u_update_cumulative(price: float, cost: float):
         )
 
 # ─── HELPERS DB KFC ───────────────────────────────────────────────────────────
-def kfc_get_db():
+def kfc_connect():
     import psycopg2, psycopg2.extras
     url = os.environ.get("KFC_DATABASE_URL", "")
     if not url:
         return None
     conn = psycopg2.connect(url)
     conn.cursor_factory = psycopg2.extras.RealDictCursor
+    conn.autocommit = False
     return conn
 
 def kfc_get_order(order_id: int):
-    db = kfc_get_db()
+    db = kfc_connect()
     if not db:
         return None
-    cur = db.cursor()
-    cur.execute("SELECT id, user_id, product_id, payment_method, status, admin_id, admin_username FROM orders WHERE id = %s", (order_id,))
-    row = cur.fetchone()
-    cur.close(); db.close()
-    return dict(row) if row else None
+    try:
+        cur = db.cursor()
+        cur.execute("SELECT id, user_id, product_id, payment_method, status, admin_id, admin_username FROM orders WHERE id = %s", (order_id,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+    finally:
+        db.close()
 
 def kfc_set_order_status(order_id: int, status: str, extra: dict = None):
-    db = kfc_get_db()
+    db = kfc_connect()
     if not db:
         return
-    fields = {"status": status}
-    if extra:
-        fields.update(extra)
-    set_clause = ", ".join(f"{k} = %s" for k in fields)
-    values = list(fields.values()) + [order_id]
-    cur = db.cursor()
-    cur.execute(f"UPDATE orders SET {set_clause} WHERE id = %s", values)
-    db.commit(); cur.close(); db.close()
+    try:
+        fields = {"status": status}
+        if extra:
+            fields.update(extra)
+        set_clause = ", ".join(f"{k} = %s" for k in fields)
+        values = list(fields.values()) + [order_id]
+        cur = db.cursor()
+        cur.execute(f"UPDATE orders SET {set_clause} WHERE id = %s", values)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"kfc_set_order_status error: {e}")
+        raise
+    finally:
+        db.close()
 
 def kfc_get_deposit(deposit_id: int):
-    db = kfc_get_db()
+    db = kfc_connect()
     if not db:
         return None
-    cur = db.cursor()
-    cur.execute("SELECT id, user_id, amount, status FROM deposits WHERE id = %s", (deposit_id,))
-    row = cur.fetchone()
-    cur.close(); db.close()
-    return dict(row) if row else None
+    try:
+        cur = db.cursor()
+        cur.execute("SELECT id, user_id, amount, status FROM deposits WHERE id = %s", (deposit_id,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+    finally:
+        db.close()
 
-def kfc_set_deposit_status(deposit_id: int, status: str):
-    db = kfc_get_db()
+def kfc_validate_deposit_atomic(deposit_id: int, user_id: int, amount: float) -> float:
+    """Valide le depot ET credite le solde en une seule transaction atomique. Retourne le nouveau solde."""
+    db = kfc_connect()
     if not db:
-        return
-    cur = db.cursor()
-    cur.execute("UPDATE deposits SET status = %s WHERE id = %s", (status, deposit_id))
-    db.commit(); cur.close(); db.close()
+        raise Exception("KFC_DATABASE_URL non configure")
+    try:
+        cur = db.cursor()
+        cur.execute("UPDATE deposits SET status = 'completed' WHERE id = %s AND status = 'pending'", (deposit_id,))
+        if cur.rowcount == 0:
+            raise Exception("Depot introuvable ou deja traite")
+        cur.execute("UPDATE users SET balance = balance + %s WHERE user_id = %s", (amount, user_id))
+        cur.execute("SELECT balance FROM users WHERE user_id = %s", (user_id,))
+        row = cur.fetchone()
+        new_balance = float(row["balance"]) if row else amount
+        db.commit()
+        return new_balance
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
-def kfc_add_balance(user_id: int, amount: float):
-    db = kfc_get_db()
+def kfc_reject_deposit_atomic(deposit_id: int):
+    db = kfc_connect()
     if not db:
-        return
-    cur = db.cursor()
-    cur.execute("UPDATE users SET balance = balance + %s WHERE user_id = %s", (amount, user_id))
-    db.commit(); cur.close(); db.close()
+        raise Exception("KFC_DATABASE_URL non configure")
+    try:
+        cur = db.cursor()
+        cur.execute("UPDATE deposits SET status = 'rejected' WHERE id = %s", (deposit_id,))
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+def kfc_get_balance(user_id: int) -> float:
+    db = kfc_connect()
+    if not db:
+        return 0.0
+    try:
+        cur = db.cursor()
+        cur.execute("SELECT balance FROM users WHERE user_id = %s", (user_id,))
+        row = cur.fetchone()
+        return float(row["balance"]) if row else 0.0
+    finally:
+        db.close()
 
 def kfc_get_balance(user_id: int) -> float:
     db = kfc_get_db()
@@ -368,22 +412,20 @@ async def handle_kfc_restore(query, order_id: int, user_id: int, product_id: str
 
 # ─── HANDLERS KFC DEPOTS ──────────────────────────────────────────────────────
 async def handle_kfc_validate_dep(query, deposit_id: int, user_id: int, amount: float):
-    dep = kfc_get_deposit(deposit_id)
-    if not dep:
-        await query.answer("Depot introuvable", show_alert=True); return
-    if dep["status"] != "pending":
-        await query.answer("Deja traite", show_alert=True); return
-
-    kfc_add_balance(user_id, amount)
-    kfc_set_deposit_status(deposit_id, "completed")
-    balance = kfc_get_balance(user_id)
+    try:
+        new_balance = kfc_validate_deposit_atomic(deposit_id, user_id, amount)
+    except Exception as e:
+        logger.error(f"Erreur validation depot #{deposit_id}: {e}")
+        await query.answer("Erreur: " + str(e), show_alert=True)
+        return
 
     await notify_client(KFC_BOT_TOKEN, user_id,
-        str(amount) + "€ ajoutes a ton solde.\nNouveau solde : " + str(round(balance, 2)) + "€")
+        str(amount) + "€ ajoutes a ton solde.\nNouveau solde : " + str(round(new_balance, 2)) + "€")
     done_text = (
         "*[KFC] Depot #" + str(deposit_id) + " valide*\n\n"
         + "User ID: `" + str(user_id) + "`\n"
         + str(amount) + "€ credites\n"
+        + "Solde: " + str(round(new_balance, 2)) + "€\n"
         + datetime.now().strftime("%d/%m/%Y %H:%M")
     )
     try:
@@ -394,11 +436,13 @@ async def handle_kfc_validate_dep(query, deposit_id: int, user_id: int, amount: 
 
 
 async def handle_kfc_reject_dep(query, deposit_id: int, user_id: int):
-    dep = kfc_get_deposit(deposit_id)
-    if not dep:
-        await query.answer("Depot introuvable", show_alert=True); return
+    try:
+        kfc_reject_deposit_atomic(deposit_id)
+    except Exception as e:
+        logger.error(f"Erreur rejet depot #{deposit_id}: {e}")
+        await query.answer("Erreur: " + str(e), show_alert=True)
+        return
 
-    kfc_set_deposit_status(deposit_id, "rejected")
     await notify_client(KFC_BOT_TOKEN, user_id, "Ton depot a ete refuse. Contacte l'admin si c'est une erreur.")
     cancel_text = (
         "*[KFC] Depot #" + str(deposit_id) + " rejete*\n\n"
