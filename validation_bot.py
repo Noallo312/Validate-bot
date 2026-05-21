@@ -1,35 +1,70 @@
 """
-validation_bot.py — Bot de validation centralisé
-Gère les commandes de B4U Deals ET KFC depuis un seul bot Telegram.
-
-Variables d'environnement requises :
-  VALIDATION_BOT_TOKEN  — token du nouveau bot de validation
-  B4U_BOT_TOKEN         — token du bot B4U Deals (pour notifier les clients)
-  KFC_BOT_TOKEN         — token du bot KFC (pour notifier les clients)
-  B4U_DATABASE_URL      — SQLite ou Postgres de B4U
-  KFC_DATABASE_URL      — Postgres de KFC
-  ADMIN_IDS             — IDs admins séparés par virgule (ex: 6976573567,5174507979)
+validation_bot.py — Bot de validation centralisé (httpx pur, sans python-telegram-bot)
+Compatible Python 3.13+
 """
 
 import asyncio
 import logging
 import os
+import httpx
 from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-VALIDATION_BOT_TOKEN = os.environ.get("VALIDATION_BOT_TOKEN", "METS_TON_TOKEN_ICI")
+VALIDATION_BOT_TOKEN = os.environ.get("VALIDATION_BOT_TOKEN", "")
 B4U_BOT_TOKEN        = os.environ.get("B4U_BOT_TOKEN", "")
 KFC_BOT_TOKEN        = os.environ.get("KFC_BOT_TOKEN", "")
 
 _raw_admins = os.environ.get("ADMIN_IDS", "6976573567,5174507979")
 ADMIN_IDS = [int(x.strip()) for x in _raw_admins.split(",") if x.strip()]
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+TG_API = "https://api.telegram.org/bot"
 
-# ─── HELPERS DB B4U ───────────────────────────────────────────────────────────
+# ─── TELEGRAM HELPERS ─────────────────────────────────────────────────────────
+async def tg_call(token: str, method: str, payload: dict) -> dict:
+    url = f"{TG_API}{token}/{method}"
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(url, json=payload)
+        return r.json()
+
+async def answer_callback(query_id: str, text: str = "", alert: bool = False):
+    await tg_call(VALIDATION_BOT_TOKEN, "answerCallbackQuery", {
+        "callback_query_id": query_id,
+        "text": text,
+        "show_alert": alert
+    })
+
+async def edit_text(chat_id: int, message_id: int, text: str, keyboard=None):
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "Markdown"}
+    if keyboard:
+        payload["reply_markup"] = {"inline_keyboard": keyboard}
+    await tg_call(VALIDATION_BOT_TOKEN, "editMessageText", payload)
+
+async def edit_caption(chat_id: int, message_id: int, text: str, keyboard=None):
+    payload = {"chat_id": chat_id, "message_id": message_id, "caption": text, "parse_mode": "Markdown"}
+    if keyboard:
+        payload["reply_markup"] = {"inline_keyboard": keyboard}
+    r = await tg_call(VALIDATION_BOT_TOKEN, "editMessageCaption", payload)
+    if not r.get("ok"):
+        await edit_text(chat_id, message_id, text, keyboard)
+
+async def send_message(token: str, chat_id: int, text: str, keyboard=None):
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    if keyboard:
+        payload["reply_markup"] = {"inline_keyboard": keyboard}
+    await tg_call(token, "sendMessage", payload)
+
+async def notify_client(token: str, user_id: int, text: str):
+    if not token:
+        return
+    try:
+        await send_message(token, user_id, text)
+    except Exception as e:
+        logger.warning(f"Erreur notif client {user_id}: {e}")
+
+# ─── DB B4U ───────────────────────────────────────────────────────────────────
 def get_b4u_engine():
     from sqlalchemy import create_engine
     url = os.environ.get("B4U_DATABASE_URL", "")
@@ -74,7 +109,7 @@ def b4u_update_cumulative(price: float, cost: float):
             {"rev": price, "profit": price - cost, "ts": datetime.now().isoformat()}
         )
 
-# ─── HELPERS DB KFC ───────────────────────────────────────────────────────────
+# ─── DB KFC ───────────────────────────────────────────────────────────────────
 def kfc_connect():
     import psycopg2, psycopg2.extras
     url = os.environ.get("KFC_DATABASE_URL", "")
@@ -111,26 +146,11 @@ def kfc_set_order_status(order_id: int, status: str, extra: dict = None):
         cur.execute(f"UPDATE orders SET {set_clause} WHERE id = %s", values)
         db.commit()
     except Exception as e:
-        db.rollback()
-        logger.error(f"kfc_set_order_status error: {e}")
-        raise
-    finally:
-        db.close()
-
-def kfc_get_deposit(deposit_id: int):
-    db = kfc_connect()
-    if not db:
-        return None
-    try:
-        cur = db.cursor()
-        cur.execute("SELECT id, user_id, amount, status FROM deposits WHERE id = %s", (deposit_id,))
-        row = cur.fetchone()
-        return dict(row) if row else None
+        db.rollback(); raise
     finally:
         db.close()
 
 def kfc_validate_deposit_atomic(deposit_id: int, user_id: int, amount: float) -> float:
-    """Valide le depot ET credite le solde en une seule transaction atomique. Retourne le nouveau solde."""
     db = kfc_connect()
     if not db:
         raise Exception("KFC_DATABASE_URL non configure")
@@ -146,8 +166,7 @@ def kfc_validate_deposit_atomic(deposit_id: int, user_id: int, amount: float) ->
         db.commit()
         return new_balance
     except Exception:
-        db.rollback()
-        raise
+        db.rollback(); raise
     finally:
         db.close()
 
@@ -160,363 +179,234 @@ def kfc_reject_deposit_atomic(deposit_id: int):
         cur.execute("UPDATE deposits SET status = 'rejected' WHERE id = %s", (deposit_id,))
         db.commit()
     except Exception:
-        db.rollback()
-        raise
+        db.rollback(); raise
     finally:
         db.close()
-
-def kfc_get_balance(user_id: int) -> float:
-    db = kfc_connect()
-    if not db:
-        return 0.0
-    try:
-        cur = db.cursor()
-        cur.execute("SELECT balance FROM users WHERE user_id = %s", (user_id,))
-        row = cur.fetchone()
-        return float(row["balance"]) if row else 0.0
-    finally:
-        db.close()
-
-def kfc_get_balance(user_id: int) -> float:
-    db = kfc_get_db()
-    if not db:
-        return 0.0
-    cur = db.cursor()
-    cur.execute("SELECT balance FROM users WHERE user_id = %s", (user_id,))
-    row = cur.fetchone()
-    cur.close(); db.close()
-    return float(row["balance"]) if row else 0.0
-
-# ─── NOTIFIER CLIENT ──────────────────────────────────────────────────────────
-async def notify_client(bot_token: str, user_id: int, text: str):
-    if not bot_token:
-        return
-    try:
-        bot = Bot(token=bot_token)
-        await bot.send_message(chat_id=user_id, text=text, parse_mode="Markdown")
-    except Exception as e:
-        logger.warning(f"Erreur notification client {user_id}: {e}")
-
-# ─── /start ───────────────────────────────────────────────────────────────────
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("Acces reserve aux admins.")
-        return
-    await update.message.reply_text(
-        "*Bot de validation centralise actif*\n\n"
-        "Reçoit les commandes de :\n"
-        "B4U Deals — abonnements streaming\n"
-        "KFC — cartes de fidelite",
-        parse_mode="Markdown"
-    )
 
 # ─── HANDLERS B4U ─────────────────────────────────────────────────────────────
-async def handle_b4u_take(query, order_id: int):
-    admin_id = query.from_user.id
-    admin_username = query.from_user.username or f"Admin_{admin_id}"
+async def handle_b4u_take(chat_id, message_id, query_id, order_id, admin_username):
     order = b4u_get_order(order_id)
     if not order:
-        await query.answer("Commande introuvable", show_alert=True); return
+        await answer_callback(query_id, "Commande introuvable", True); return
     if order["status"] != "en_attente":
-        await query.answer("Commande deja prise ou terminee", show_alert=True); return
+        await answer_callback(query_id, "Commande deja prise ou terminee", True); return
 
     b4u_set_status(order_id, "en_cours", {
-        "admin_id": admin_id,
         "admin_username": admin_username,
         "taken_at": datetime.now().isoformat()
     })
-
-    text = (
-        "*[B4U] COMMANDE #" + str(order_id) + " — PRISE EN CHARGE*\n\n"
+    text = ("*[B4U] COMMANDE #" + str(order_id) + " PRISE EN CHARGE*\n\n"
         + ("@" + str(order["username"]) if order["username"] else "ID: " + str(order["user_id"])) + "\n"
-        + str(order["service"]) + "\n"
-        + str(order["plan"]) + "\n"
+        + str(order["service"]) + " - " + str(order["plan"]) + "\n"
         + str(order["price"]) + "€  |  Cout: " + str(order["cost"]) + "€\n\n"
         + "Pris par @" + admin_username + "\n"
-        + datetime.now().strftime("%d/%m/%Y %H:%M")
-    )
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("Terminer", callback_data=f"b4u_complete_{order_id}"),
-        InlineKeyboardButton("Annuler",  callback_data=f"b4u_cancel_{order_id}"),
-    ], [
-        InlineKeyboardButton("Remettre", callback_data=f"b4u_restore_{order_id}"),
-    ]])
-    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
-    await query.answer("Commande prise en charge")
+        + datetime.now().strftime("%d/%m/%Y %H:%M"))
+    kb = [[
+        {"text": "Terminer", "callback_data": f"b4u_complete_{order_id}"},
+        {"text": "Annuler",  "callback_data": f"b4u_cancel_{order_id}"}
+    ],[
+        {"text": "Remettre", "callback_data": f"b4u_restore_{order_id}"}
+    ]]
+    await edit_text(chat_id, message_id, text, kb)
+    await answer_callback(query_id, "Prise en charge")
 
-
-async def handle_b4u_complete(query, order_id: int):
+async def handle_b4u_complete(chat_id, message_id, query_id, order_id, admin_username):
     order = b4u_get_order(order_id)
     if not order:
-        await query.answer("Introuvable", show_alert=True); return
+        await answer_callback(query_id, "Introuvable", True); return
     if order["status"] == "terminee":
-        await query.answer("Deja terminee", show_alert=True); return
-
+        await answer_callback(query_id, "Deja terminee", True); return
     b4u_set_status(order_id, "terminee")
     b4u_update_cumulative(order["price"], order["cost"])
+    await edit_text(chat_id, message_id,
+        "*[B4U] COMMANDE #" + str(order_id) + " TERMINEE*\n\nPar @" + admin_username + "\n" + datetime.now().strftime("%d/%m/%Y %H:%M"))
+    await answer_callback(query_id, "Terminee")
 
-    await query.edit_message_text(
-        "*[B4U] COMMANDE #" + str(order_id) + " — TERMINEE*\n\n"
-        + "Terminee par @" + (query.from_user.username or "Admin") + "\n"
-        + datetime.now().strftime("%d/%m/%Y %H:%M"),
-        parse_mode="Markdown"
-    )
-    await query.answer("Terminee")
+async def handle_b4u_cancel(chat_id, message_id, query_id, order_id, admin_username):
+    b4u_set_status(order_id, "annulee", {"cancelled_at": datetime.now().isoformat()})
+    await edit_text(chat_id, message_id,
+        "*[B4U] COMMANDE #" + str(order_id) + " ANNULEE*\n\nPar @" + admin_username + "\n" + datetime.now().strftime("%d/%m/%Y %H:%M"))
+    await answer_callback(query_id, "Annulee")
 
-
-async def handle_b4u_cancel(query, order_id: int):
-    b4u_set_status(order_id, "annulee", {
-        "cancelled_by": query.from_user.id,
-        "cancelled_at": datetime.now().isoformat()
-    })
-    await query.edit_message_text(
-        "*[B4U] COMMANDE #" + str(order_id) + " — ANNULEE*\n\n"
-        + "Annulee par @" + (query.from_user.username or "Admin") + "\n"
-        + datetime.now().strftime("%d/%m/%Y %H:%M"),
-        parse_mode="Markdown"
-    )
-    await query.answer("Annulee")
-
-
-async def handle_b4u_restore(query, order_id: int):
+async def handle_b4u_restore(chat_id, message_id, query_id, order_id):
     order = b4u_get_order(order_id)
     if not order:
-        await query.answer("Introuvable", show_alert=True); return
-
-    b4u_set_status(order_id, "en_attente", {
-        "admin_id": None, "admin_username": None,
-        "taken_at": None, "cancelled_by": None, "cancelled_at": None
-    })
-
-    text = (
-        "*[B4U] COMMANDE #" + str(order_id) + " REMISE EN LIGNE*\n\n"
+        await answer_callback(query_id, "Introuvable", True); return
+    b4u_set_status(order_id, "en_attente", {"admin_id": None, "admin_username": None, "taken_at": None})
+    text = ("*[B4U] COMMANDE #" + str(order_id) + " REMISE EN LIGNE*\n\n"
         + ("@" + str(order["username"]) if order["username"] else "ID: " + str(order["user_id"])) + "\n"
-        + str(order["service"]) + " — " + str(order["plan"]) + "\n"
-        + str(order["price"]) + "€\n"
-        + datetime.now().strftime("%d/%m/%Y %H:%M")
-    )
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("Prendre", callback_data=f"b4u_take_{order_id}"),
-        InlineKeyboardButton("Annuler", callback_data=f"b4u_cancel_{order_id}"),
-    ]])
+        + str(order["service"]) + " - " + str(order["plan"]) + "\n"
+        + str(order["price"]) + "€\n" + datetime.now().strftime("%d/%m/%Y %H:%M"))
+    kb = [[{"text": "Prendre", "callback_data": f"b4u_take_{order_id}"}, {"text": "Annuler", "callback_data": f"b4u_cancel_{order_id}"}]]
     for admin_id in ADMIN_IDS:
-        try:
-            await query.get_bot().send_message(admin_id, text, parse_mode="Markdown", reply_markup=keyboard)
-        except Exception:
-            pass
-    await query.answer("Remise en ligne")
+        await send_message(VALIDATION_BOT_TOKEN, admin_id, text, kb)
+    await answer_callback(query_id, "Remise en ligne")
 
 # ─── HANDLERS KFC COMMANDES ───────────────────────────────────────────────────
-async def handle_kfc_take(query, order_id: int, user_id: int, product_id: str):
-    admin_id = query.from_user.id
-    admin_username = query.from_user.username or f"Admin_{admin_id}"
+async def handle_kfc_take(chat_id, message_id, query_id, order_id, user_id, product_id, admin_username):
     order = kfc_get_order(order_id)
     if not order:
-        await query.answer("Commande introuvable", show_alert=True); return
+        await answer_callback(query_id, "Commande introuvable", True); return
     if order["status"] not in ("pending", "awaiting_proof"):
-        await query.answer("Commande deja prise ou terminee", show_alert=True); return
-
-    kfc_set_order_status(order_id, "processing", {
-        "admin_id": admin_id,
-        "admin_username": admin_username,
-        "taken_at": datetime.now().isoformat()
-    })
-
-    text = (
-        "*[KFC] COMMANDE #" + str(order_id) + " — PRISE EN CHARGE*\n\n"
+        await answer_callback(query_id, "Deja prise ou terminee", True); return
+    kfc_set_order_status(order_id, "processing", {"admin_username": admin_username, "taken_at": datetime.now().isoformat()})
+    text = ("*[KFC] COMMANDE #" + str(order_id) + " PRISE EN CHARGE*\n\n"
         + "User ID: `" + str(user_id) + "`\n"
-        + "Produit: " + str(product_id) + "\n"
-        + "Paiement: " + str(order.get("payment_method", "PayPal")) + "\n\n"
+        + "Produit: " + str(product_id) + "\n\n"
         + "Pris par @" + admin_username + "\n"
-        + datetime.now().strftime("%d/%m/%Y %H:%M")
-    )
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("Valider & Livrer", callback_data=f"kfc_complete_{order_id}_{user_id}_{product_id}"),
-        InlineKeyboardButton("Annuler", callback_data=f"kfc_cancel_{order_id}_{user_id}"),
-    ], [
-        InlineKeyboardButton("Remettre", callback_data=f"kfc_restore_{order_id}_{user_id}_{product_id}"),
-    ]])
-    try:
-        await query.edit_message_caption(caption=text, parse_mode="Markdown", reply_markup=keyboard)
-    except Exception:
-        await query.edit_message_text(text=text, parse_mode="Markdown", reply_markup=keyboard)
-    await query.answer("Prise en charge")
+        + datetime.now().strftime("%d/%m/%Y %H:%M"))
+    kb = [[
+        {"text": "Valider & Livrer", "callback_data": f"kfc_complete_{order_id}_{user_id}_{product_id}"},
+        {"text": "Annuler", "callback_data": f"kfc_cancel_{order_id}_{user_id}"}
+    ],[
+        {"text": "Remettre", "callback_data": f"kfc_restore_{order_id}_{user_id}_{product_id}"}
+    ]]
+    await edit_caption(chat_id, message_id, text, kb)
+    await answer_callback(query_id, "Prise en charge")
 
-
-async def handle_kfc_complete(query, order_id: int, user_id: int, product_id: str):
+async def handle_kfc_complete(chat_id, message_id, query_id, order_id, user_id, product_id, admin_username):
     order = kfc_get_order(order_id)
     if not order:
-        await query.answer("Introuvable", show_alert=True); return
+        await answer_callback(query_id, "Introuvable", True); return
     if order["status"] == "completed":
-        await query.answer("Deja terminee", show_alert=True); return
-
+        await answer_callback(query_id, "Deja terminee", True); return
     kfc_set_order_status(order_id, "completed")
-
-    # Notifier le client et declencher la livraison via le bot KFC
     await notify_client(KFC_BOT_TOKEN, user_id, "Commande validee ! Ton compte KFC est en cours de livraison...")
-    try:
-        kfc_bot = Bot(token=KFC_BOT_TOKEN)
-        cmd = f"/webhook_deliver_{user_id}_{product_id}_{order_id}"
-        await kfc_bot.send_message(chat_id=ADMIN_IDS[0], text=cmd)
-    except Exception as e:
-        logger.warning(f"Erreur declenchement livraison KFC: {e}")
+    await edit_caption(chat_id, message_id,
+        "*[KFC] COMMANDE #" + str(order_id) + " VALIDEE*\n\nPar @" + admin_username + "\n" + datetime.now().strftime("%d/%m/%Y %H:%M"))
+    await answer_callback(query_id, "Validee")
 
-    done_text = (
-        "*[KFC] COMMANDE #" + str(order_id) + " — VALIDEE*\n\n"
-        + "Validee par @" + (query.from_user.username or "Admin") + "\n"
-        + datetime.now().strftime("%d/%m/%Y %H:%M")
-    )
-    try:
-        await query.edit_message_caption(caption=done_text, parse_mode="Markdown")
-    except Exception:
-        await query.edit_message_text(text=done_text, parse_mode="Markdown")
-    await query.answer("Validee")
-
-
-async def handle_kfc_cancel(query, order_id: int, user_id: int):
+async def handle_kfc_cancel(chat_id, message_id, query_id, order_id, user_id, admin_username):
     kfc_set_order_status(order_id, "rejected", {"cancelled_at": datetime.now().isoformat()})
     await notify_client(KFC_BOT_TOKEN, user_id, "Ta commande a ete annulee. Contacte l'admin si c'est une erreur.")
-    cancel_text = (
-        "*[KFC] COMMANDE #" + str(order_id) + " — ANNULEE*\n\n"
-        + "Annulee par @" + (query.from_user.username or "Admin") + "\n"
-        + datetime.now().strftime("%d/%m/%Y %H:%M")
-    )
-    try:
-        await query.edit_message_caption(caption=cancel_text, parse_mode="Markdown")
-    except Exception:
-        await query.edit_message_text(text=cancel_text, parse_mode="Markdown")
-    await query.answer("Annulee")
+    await edit_caption(chat_id, message_id,
+        "*[KFC] COMMANDE #" + str(order_id) + " ANNULEE*\n\nPar @" + admin_username + "\n" + datetime.now().strftime("%d/%m/%Y %H:%M"))
+    await answer_callback(query_id, "Annulee")
 
-
-async def handle_kfc_restore(query, order_id: int, user_id: int, product_id: str):
-    kfc_set_order_status(order_id, "awaiting_proof", {
-        "admin_id": None, "admin_username": None,
-        "taken_at": None, "cancelled_at": None
-    })
-    text = (
-        "*[KFC] COMMANDE #" + str(order_id) + " REMISE EN LIGNE*\n\n"
-        + "User ID: `" + str(user_id) + "`\n"
-        + "Produit: " + str(product_id) + "\n"
-        + datetime.now().strftime("%d/%m/%Y %H:%M")
-    )
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("Prendre", callback_data=f"kfc_take_{order_id}_{user_id}_{product_id}"),
-        InlineKeyboardButton("Annuler", callback_data=f"kfc_cancel_{order_id}_{user_id}"),
-    ]])
+async def handle_kfc_restore(chat_id, message_id, query_id, order_id, user_id, product_id):
+    kfc_set_order_status(order_id, "awaiting_proof", {"admin_id": None, "admin_username": None, "taken_at": None})
+    text = ("*[KFC] COMMANDE #" + str(order_id) + " REMISE EN LIGNE*\n\n"
+        + "User ID: `" + str(user_id) + "`\nProduit: " + str(product_id) + "\n"
+        + datetime.now().strftime("%d/%m/%Y %H:%M"))
+    kb = [[{"text": "Prendre", "callback_data": f"kfc_take_{order_id}_{user_id}_{product_id}"}, {"text": "Annuler", "callback_data": f"kfc_cancel_{order_id}_{user_id}"}]]
     for admin_id in ADMIN_IDS:
-        try:
-            await query.get_bot().send_message(admin_id, text, parse_mode="Markdown", reply_markup=keyboard)
-        except Exception:
-            pass
-    await query.answer("Remise en ligne")
+        await send_message(VALIDATION_BOT_TOKEN, admin_id, text, kb)
+    await answer_callback(query_id, "Remise en ligne")
 
 # ─── HANDLERS KFC DEPOTS ──────────────────────────────────────────────────────
-async def handle_kfc_validate_dep(query, deposit_id: int, user_id: int, amount: float):
+async def handle_kfc_validate_dep(chat_id, message_id, query_id, deposit_id, user_id, amount):
     try:
         new_balance = kfc_validate_deposit_atomic(deposit_id, user_id, amount)
     except Exception as e:
         logger.error(f"Erreur validation depot #{deposit_id}: {e}")
-        await query.answer("Erreur: " + str(e), show_alert=True)
-        return
-
+        await answer_callback(query_id, "Erreur: " + str(e), True); return
     await notify_client(KFC_BOT_TOKEN, user_id,
-        str(amount) + "€ ajoutes a ton solde.\nNouveau solde : " + str(round(new_balance, 2)) + "€")
-    done_text = (
-        "*[KFC] Depot #" + str(deposit_id) + " valide*\n\n"
-        + "User ID: `" + str(user_id) + "`\n"
-        + str(amount) + "€ credites\n"
-        + "Solde: " + str(round(new_balance, 2)) + "€\n"
-        + datetime.now().strftime("%d/%m/%Y %H:%M")
-    )
-    try:
-        await query.edit_message_caption(caption=done_text, parse_mode="Markdown")
-    except Exception:
-        await query.edit_message_text(text=done_text, parse_mode="Markdown")
-    await query.answer("Depot valide")
+        str(amount) + "€ ajoutes a ton solde.\nNouveau solde: " + str(round(new_balance, 2)) + "€")
+    await edit_caption(chat_id, message_id,
+        "*[KFC] Depot #" + str(deposit_id) + " valide*\n\n`" + str(user_id) + "`\n"
+        + str(amount) + "€ credites | Solde: " + str(round(new_balance, 2)) + "€\n"
+        + datetime.now().strftime("%d/%m/%Y %H:%M"))
+    await answer_callback(query_id, "Depot valide")
 
-
-async def handle_kfc_reject_dep(query, deposit_id: int, user_id: int):
+async def handle_kfc_reject_dep(chat_id, message_id, query_id, deposit_id, user_id):
     try:
         kfc_reject_deposit_atomic(deposit_id)
     except Exception as e:
         logger.error(f"Erreur rejet depot #{deposit_id}: {e}")
-        await query.answer("Erreur: " + str(e), show_alert=True)
-        return
-
+        await answer_callback(query_id, "Erreur: " + str(e), True); return
     await notify_client(KFC_BOT_TOKEN, user_id, "Ton depot a ete refuse. Contacte l'admin si c'est une erreur.")
-    cancel_text = (
-        "*[KFC] Depot #" + str(deposit_id) + " rejete*\n\n"
-        + "User ID: `" + str(user_id) + "`\n"
-        + datetime.now().strftime("%d/%m/%Y %H:%M")
-    )
+    await edit_caption(chat_id, message_id,
+        "*[KFC] Depot #" + str(deposit_id) + " rejete*\n\n`" + str(user_id) + "`\n"
+        + datetime.now().strftime("%d/%m/%Y %H:%M"))
+    await answer_callback(query_id, "Rejete")
+
+# ─── ROUTER ───────────────────────────────────────────────────────────────────
+async def handle_callback_query(cq: dict):
+    query_id  = cq["id"]
+    data      = cq.get("data", "")
+    chat_id   = cq["message"]["chat"]["id"]
+    message_id = cq["message"]["message_id"]
+    from_id   = cq["from"]["id"]
+    admin_username = cq["from"].get("username") or f"Admin_{from_id}"
+
+    if from_id not in ADMIN_IDS:
+        await answer_callback(query_id, "Non autorise", True); return
+
     try:
-        await query.edit_message_caption(caption=cancel_text, parse_mode="Markdown")
-    except Exception:
-        await query.edit_message_text(text=cancel_text, parse_mode="Markdown")
-    await query.answer("Rejete")
+        # B4U
+        if data.startswith("b4u_take_"):
+            await handle_b4u_take(chat_id, message_id, query_id, int(data.split("_")[-1]), admin_username)
+        elif data.startswith("b4u_complete_"):
+            await handle_b4u_complete(chat_id, message_id, query_id, int(data.split("_")[-1]), admin_username)
+        elif data.startswith("b4u_cancel_"):
+            await handle_b4u_cancel(chat_id, message_id, query_id, int(data.split("_")[-1]), admin_username)
+        elif data.startswith("b4u_restore_"):
+            await handle_b4u_restore(chat_id, message_id, query_id, int(data.split("_")[-1]))
 
-# ─── ROUTER PRINCIPAL ─────────────────────────────────────────────────────────
-async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if query.from_user.id not in ADMIN_IDS:
-        await query.answer("Non autorise", show_alert=True)
-        return
-    await query.answer()
+        # KFC commandes — kfc_xxx_<order_id>_<user_id>_<product_id>
+        elif data.startswith("kfc_take_"):
+            p = data.split("_")
+            await handle_kfc_take(chat_id, message_id, query_id, int(p[2]), int(p[3]), p[4], admin_username)
+        elif data.startswith("kfc_complete_"):
+            p = data.split("_")
+            await handle_kfc_complete(chat_id, message_id, query_id, int(p[2]), int(p[3]), p[4], admin_username)
+        elif data.startswith("kfc_cancel_"):
+            p = data.split("_")
+            await handle_kfc_cancel(chat_id, message_id, query_id, int(p[2]), int(p[3]), admin_username)
+        elif data.startswith("kfc_restore_"):
+            p = data.split("_")
+            await handle_kfc_restore(chat_id, message_id, query_id, int(p[2]), int(p[3]), p[4])
 
-    data = query.data
+        # KFC depots — validatedep_<dep_id>_<user_id>_<amount>
+        elif data.startswith("validatedep_"):
+            p = data.split("_")
+            await handle_kfc_validate_dep(chat_id, message_id, query_id, int(p[1]), int(p[2]), float(p[3]))
+        elif data.startswith("rejectdep_"):
+            p = data.split("_")
+            await handle_kfc_reject_dep(chat_id, message_id, query_id, int(p[1]), int(p[2]))
+        else:
+            await answer_callback(query_id, "Action inconnue", True)
 
-    # B4U
-    if data.startswith("b4u_take_"):
-        await handle_b4u_take(query, int(data.split("_")[-1]))
-    elif data.startswith("b4u_complete_"):
-        await handle_b4u_complete(query, int(data.split("_")[-1]))
-    elif data.startswith("b4u_cancel_"):
-        await handle_b4u_cancel(query, int(data.split("_")[-1]))
-    elif data.startswith("b4u_restore_"):
-        await handle_b4u_restore(query, int(data.split("_")[-1]))
+    except Exception as e:
+        logger.error(f"Erreur handler {data}: {e}")
+        await answer_callback(query_id, "Erreur interne: " + str(e)[:50], True)
 
-    # KFC commandes — format: kfc_xxx_<order_id>_<user_id>_<product_id>
-    elif data.startswith("kfc_take_"):
-        parts = data.split("_")
-        await handle_kfc_take(query, int(parts[2]), int(parts[3]), parts[4])
-    elif data.startswith("kfc_complete_"):
-        parts = data.split("_")
-        await handle_kfc_complete(query, int(parts[2]), int(parts[3]), parts[4])
-    elif data.startswith("kfc_cancel_"):
-        parts = data.split("_")
-        await handle_kfc_cancel(query, int(parts[2]), int(parts[3]))
-    elif data.startswith("kfc_restore_"):
-        parts = data.split("_")
-        await handle_kfc_restore(query, int(parts[2]), int(parts[3]), parts[4])
+async def handle_message(msg: dict):
+    chat_id = msg["chat"]["id"]
+    from_id = msg["from"]["id"]
+    text = msg.get("text", "")
+    if text == "/start" and from_id in ADMIN_IDS:
+        await send_message(VALIDATION_BOT_TOKEN, chat_id,
+            "*Bot de validation centralise actif*\n\nReçoit les commandes de B4U Deals et KFC.")
 
-    # KFC depots
-    elif data.startswith("validatedep_"):
-        parts = data.split("_")
-        await handle_kfc_validate_dep(query, int(parts[1]), int(parts[2]), float(parts[3]))
-    elif data.startswith("rejectdep_"):
-        parts = data.split("_")
-        await handle_kfc_reject_dep(query, int(parts[1]), int(parts[2]))
-
-    else:
-        await query.answer("Action inconnue", show_alert=True)
-
-# ─── MAIN ─────────────────────────────────────────────────────────────────────
-def main():
-    if not VALIDATION_BOT_TOKEN or VALIDATION_BOT_TOKEN == "METS_TON_TOKEN_ICI":
-        logger.error("VALIDATION_BOT_TOKEN non configure !")
-        return
-
-    app = Application.builder().token(VALIDATION_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(callback_router))
-
-    logger.info("Bot de validation centralise demarre")
-    app.run_polling(
-        allowed_updates=["message", "callback_query"],
-        drop_pending_updates=True,
-        close_loop=False
-    )
-
+# ─── POLLING LOOP ─────────────────────────────────────────────────────────────
+async def polling_loop():
+    offset = 0
+    logger.info("Bot de validation centralise demarre (httpx polling)")
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=35) as client:
+                r = await client.post(
+                    f"{TG_API}{VALIDATION_BOT_TOKEN}/getUpdates",
+                    json={"offset": offset, "timeout": 30, "allowed_updates": ["message", "callback_query"]}
+                )
+                data = r.json()
+                if not data.get("ok"):
+                    logger.error(f"getUpdates error: {data}")
+                    await asyncio.sleep(5)
+                    continue
+                for update in data.get("result", []):
+                    offset = update["update_id"] + 1
+                    if "callback_query" in update:
+                        await handle_callback_query(update["callback_query"])
+                    elif "message" in update:
+                        await handle_message(update["message"])
+        except Exception as e:
+            logger.error(f"Polling error: {e}")
+            await asyncio.sleep(5)
 
 if __name__ == "__main__":
-    main()
+    if not VALIDATION_BOT_TOKEN:
+        logger.error("VALIDATION_BOT_TOKEN non configure !")
+    else:
+        asyncio.run(polling_loop())
