@@ -324,6 +324,90 @@ async def handle_kfc_reject_dep(chat_id, message_id, query_id, deposit_id, user_
         + datetime.now().strftime("%d/%m/%Y %H:%M"))
     await answer_callback(query_id, "Rejete")
 
+# ─── HANDLERS KFC PAIEMENTS ───────────────────────────────────────────────────
+async def handle_kfc_payment_callbacks(cq: dict):
+    query_id = cq["id"]
+    data = cq.get("data", "")
+    chat_id = cq["message"]["chat"]["id"]
+    message_id = cq["message"]["message_id"]
+    from_id = cq["from"]["id"]
+
+    if from_id not in ADMIN_IDS:
+        await answer_callback(query_id, "Non autorisé", True)
+        return
+
+    try:
+        import psycopg2, psycopg2.extras, os
+        KFC_DB = os.environ.get("DATABASE_URL", "")
+
+        def kfc_db():
+            conn = psycopg2.connect(KFC_DB)
+            conn.cursor_factory = psycopg2.extras.RealDictCursor
+            return conn
+
+        # ── Valider commande PayPal ──
+        if data.startswith("validate_") and not data.startswith("validatedep_"):
+            order_id = int(data.split("_")[1])
+            db = kfc_db(); cur = db.cursor()
+            cur.execute("SELECT user_id, product_id FROM orders WHERE id = %s", (order_id,))
+            row = cur.fetchone()
+            if not row:
+                await answer_callback(query_id, "Introuvable", True); db.close(); return
+            cur.execute("UPDATE orders SET status = 'completed' WHERE id = %s", (order_id,))
+            db.commit(); db.close()
+            await send_message(KFC_BOT_TOKEN, row["user_id"],
+                "✅ Ta commande PayPal a été validée ! Tu vas recevoir ton compte sous peu.")
+            await edit_caption(chat_id, message_id, f"✅ Commande #{order_id} validée.")
+            await answer_callback(query_id, "Validée")
+
+        # ── Rejeter commande PayPal ──
+        elif data.startswith("reject_") and not data.startswith("rejectdep_"):
+            order_id = int(data.split("_")[1])
+            db = kfc_db(); cur = db.cursor()
+            cur.execute("SELECT user_id FROM orders WHERE id = %s", (order_id,))
+            row = cur.fetchone()
+            if row:
+                cur.execute("UPDATE orders SET status = 'rejected' WHERE id = %s", (order_id,))
+                db.commit()
+                await send_message(KFC_BOT_TOKEN, row["user_id"],
+                    "❌ Ta preuve PayPal a été refusée. Contacte l'admin si erreur.")
+            db.close()
+            await edit_caption(chat_id, message_id, f"❌ Commande #{order_id} rejetée.")
+            await answer_callback(query_id, "Rejetée")
+
+        # ── Valider dépôt PayPal ──
+        elif data.startswith("validatedep_"):
+            parts = data.split("_")
+            deposit_id, user_id, amount = int(parts[1]), int(parts[2]), float(parts[3])
+            db = kfc_db(); cur = db.cursor()
+            cur.execute("UPDATE users SET balance = balance + %s WHERE user_id = %s", (amount, user_id))
+            cur.execute("UPDATE deposits SET status = 'completed' WHERE id = %s", (deposit_id,))
+            cur.execute("SELECT balance FROM users WHERE user_id = %s", (user_id,))
+            row = cur.fetchone()
+            new_balance = float(row["balance"]) if row else amount
+            db.commit(); db.close()
+            await send_message(KFC_BOT_TOKEN, user_id,
+                f"✅ *{amount:.2f}€* ajoutés à ton solde.\n💰 Nouveau solde : *{round(new_balance,2):.2f}€*")
+            await edit_caption(chat_id, message_id,
+                f"✅ Dépôt #{deposit_id} de {amount:.2f}€ crédité.")
+            await answer_callback(query_id, "Crédité")
+
+        # ── Rejeter dépôt PayPal ──
+        elif data.startswith("rejectdep_"):
+            parts = data.split("_")
+            deposit_id, user_id = int(parts[1]), int(parts[2])
+            db = kfc_db(); cur = db.cursor()
+            cur.execute("UPDATE deposits SET status = 'rejected' WHERE id = %s", (deposit_id,))
+            db.commit(); db.close()
+            await send_message(KFC_BOT_TOKEN, user_id,
+                "❌ Ton dépôt PayPal a été refusé. Contacte l'admin si erreur.")
+            await edit_caption(chat_id, message_id, f"❌ Dépôt #{deposit_id} rejeté.")
+            await answer_callback(query_id, "Rejeté")
+
+    except Exception as e:
+        logger.error(f"[KFC_PAYMENT] Erreur: {e}")
+        await answer_callback(query_id, f"Erreur: {str(e)[:50]}", True)
+
 # ─── ROUTER ───────────────────────────────────────────────────────────────────
 async def handle_callback_query(cq: dict):
     query_id  = cq["id"]
@@ -368,6 +452,10 @@ async def handle_callback_query(cq: dict):
         elif data.startswith("rejectdep_"):
             p = data.split("_")
             await handle_kfc_reject_dep(chat_id, message_id, query_id, int(p[1]), int(p[2]))
+
+        # KFC paiements PayPal (validate_ / reject_)
+        elif data.startswith("validate_") or data.startswith("reject_"):
+            await handle_kfc_payment_callbacks(cq)
         else:
             await answer_callback(query_id, "Action inconnue", True)
 
